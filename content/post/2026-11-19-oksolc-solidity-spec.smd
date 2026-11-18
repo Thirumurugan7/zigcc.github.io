@@ -1,0 +1,112 @@
+---
+.title = "用 Zig 重写 Solidity 编译器：oksolc 与 Solidity Spec",
+.date = @date("2026-11-19T03:00:00+0530"),
+.author = "Thiru",
+.layout = "post.shtml",
+.draft = false,
+.custom = {
+  .ai_generated = true,
+},
+---
+
+> 作者在 OKcontract 担任 DevRel，本文介绍的 oksolc 和 Solidity Spec 都由 OKcontract 开发。
+
+我们在 OKcontract 开发的 Solidity 协议 Chainwall 代码量很大，测试也很多。包括测试在内，编译或重新编译一次都要超过 10 分钟，一天要等几十次。这就是用 Zig 重写 Solidity 编译器的起因，结果就是面向开发流程的编译器 [oksolc](https://github.com/okcontract/oksolc)。
+
+要构建并验证一个编译器，需要精确地描述它必须保持的行为。这部分工作最后独立成了第二个项目 [Solidity Spec](https://github.com/okcontract/solidity-spec)。
+
+## oksolc 是什么
+
+oksolc 从把原版 C++ 编译器机械移植到 Zig 起步，因此是 GPLv3 下的衍生作品。`src` 目录下大约有 15.6 万行 Zig 代码，没有 C++。它借助 Zig 和 C 的直接互操作，使用了 yyjson 和 SQLite 这两个 C 库。开发过程中使用了 AI 辅助，团队本身有编译器和形式化验证方面的经验。
+
+它的兼容目标是原版 solc 0.8.36 的 Standard JSON 输出、创建字节码和诊断信息。目前支持的编译路径是通过 Standard JSON 接口、开启优化的 via-IR 管线，legacy 代码生成路径已经移除。
+
+除了命令行工具，oksolc 还提供 libsolc 的 C ABI 和一个 Zig 模块，可以直接嵌入其他工具。
+
+## 速度从哪里来
+
+主要有两个来源。
+
+第一是并行。前端解析仍然是顺序执行的，但前端之后各个合约基本互不依赖，所以每个合约的 Yul 优化和 EVM 代码生成可以并行进行：
+
+```sh
+oksolc compile --parallel --jobs 4 Contract.sol Library.sol
+```
+
+第二是增量编译。oksolc 会保留之前的编译结果，并用 SQLite 做持久化缓存，进程重启后也能复用。`oksolc serve --stdio` 可以让编辑器或构建工具一直连着一个常驻的编译会话。
+
+下面是 OKcontract 公布的测试结果，对比的是串行的 solc 和开 4 个 job 的 oksolc，源码、编译设置和编译输出都相同：
+
+- Uniswap V4 完整编译：solc 59.02 秒，oksolc 11.18 秒，快 5.3 倍
+- Pendle V2 小改动后重新编译：solc 38.89 秒，oksolc 1.41 秒，快 27.6 倍
+- Chainwall 完整编译：solc 709.84 秒，oksolc 138.42 秒，快 5.1 倍
+
+开 4 个 job 时，Chainwall 小改动后重新编译只需要 17.2 秒。复现脚本在仓库里：`test/benchmarks/external-compare.sh`。
+
+## 在 Foundry 里使用
+
+在 `foundry.toml` 里把编译器指向 oksolc，并开启它支持的 via-IR 优化管线：
+
+```toml
+[profile.default]
+solc = "/absolute/path/to/oksolc/zig-out/bin/oksolc"
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+```
+
+之后照常运行 `forge build` 即可。想开启并行编译，在 `foundry.toml` 旁边加一个 `oksolc.toml`：
+
+```toml
+parallel = true
+jobs = 4
+```
+
+## 和 solc 的差异
+
+oksolc 追求和 solc 0.8.36 字节级一致，但 README 里列出了 10 处有意的差异。大部分只影响 IR 文本、gas 估算，或者是某些边界输入能否通过编译。
+
+对两边都能编译的普通代码来说，唯一会改变运行时行为的，是 `require` 里带命名参数的自定义错误：
+
+```
+error X(uint256 a, uint256 b);
+
+function f() external pure {
+    require(false, X({b: 2, a: 1}));
+}
+```
+
+solc 0.8.36 via-IR 编译后回滚数据是 `X(2, 1)`，也就是按书写顺序把值放进了参数位置，忽略了参数名。oksolc 编码为 `X(1, 2)`。同样的写法换成 `revert X({b: 2, a: 1})`，两个编译器都得到 `X(1, 2)`。参数表达式的求值顺序两边一致，只有编码位置不同。如果需要和 solc 完全一致的字节码，可以把参数按位置传入，例如 `X(1, 2)`。在我们的测试中，这样写的合约在两个编译器下得到的字节码完全相同，包括元数据。
+
+## 为什么还需要 Solidity Spec
+
+做一个第二实现，最直接的验证方法是和 solc 做差分测试：同样的输入，比较两边的输出。但差分测试只能告诉你两个编译器不一致，没法告诉你哪一边是对的。遇到上面这类差异，要判断哪边正确，只能回到文档和语言的设计意图。
+
+更麻烦的是，有些行为语言本身就没有规定唯一答案。看这个例子：`a` 和 `b` 是指向同一个单元素 `uint256[]` 的内存引用，初始值为 `1`：
+
+```
+(a[0] = 2) + b[0]
+```
+
+如果在赋值之前读取 `b`，结果是 `3`；之后读取，结果是 `4`。Solidity 保证语句顺序和布尔短路，但普通子表达式的求值顺序是未指定的。编译出来的产物只会选其中一种顺序，所以一个源码层面的模型必须覆盖所有允许的选择。
+
+Solidity Spec 是用 Lean 写成的一个可执行的 Solidity 形式化模型，目前是研究预览版，目标版本是 Solidity 0.8.36、Cancun EVM 和 Lean 4.29.0。因为模型可以执行，既能拿具体程序去跑，也能在 Lean 里证明性质。它在每个表达式组上暴露求值顺序的选择，并对共享的物理内存单元建模。
+
+主要的安全性定理是：在受支持的范围内，给定合法的初始状态和一个封闭且通过检查的函数表，对所有允许的求值顺序，任何燃料足够的有限执行要么保持该不变式，要么得到一个合法的源码层结果。源码层的失败会回滚到检查点。宿主燃料和 EVM gas 分开计算，所以这个定理不需要假设程序终止。
+
+它目前没有覆盖整个 Solidity。执行机器接收的是已经完成名称解析的类型化语法树，源码解析和细化在验证边界之外。任意外部调用、内联汇编、完整的 ABI 编码和端到端的编译器保持性证明，都还是后续工作。
+
+在仓库根目录、使用固定的 Lean 工具链运行：
+
+```sh
+make replay
+```
+
+就会构建库和回归模块，并从头重新检查基础、试点和标量机器部分的证明。
+
+## 链接
+
+- oksolc：https://github.com/okcontract/oksolc
+- Solidity Spec：https://github.com/okcontract/solidity-spec
+- oksolc 介绍文章：https://okcontract.com/blog/a-new-solidity-compiler-in-zig
+- Solidity Spec 介绍文章：https://okcontract.com/blog/introducing-solidity-spec/
